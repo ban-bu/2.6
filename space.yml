@@ -1,0 +1,9 @@
+title: Vibe Meeting - AI赋能的智能组会讨论平台
+emoji: 🤖
+colorFrom: purple
+colorTo: blue
+sdk: static
+app_file: index.html
+pinned: false
+license: mit
+app_port: 3000
