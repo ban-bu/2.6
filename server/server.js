@@ -189,7 +189,8 @@ const memoryStorage = {
                 messages: [],
                 participants: new Map(),
                 roomInfo: null, // 房间信息（包含创建者）
-                voiceParticipants: new Set() // 參與語音的用戶ID集合
+                voiceParticipants: new Set(), // 參與語音的用戶ID集合
+                transcript: [] // 字幕行集合 { userId, username, text, final, ts }
             });
         }
         return this.rooms.get(roomId);
@@ -270,6 +271,20 @@ const memoryStorage = {
     getVoiceParticipants(roomId) {
         const room = this.getRoom(roomId);
         return Array.from(room.voiceParticipants);
+    },
+    // 字幕
+    addTranscriptLine(roomId, line) {
+        const room = this.getRoom(roomId);
+        room.transcript.push({ ...line, ts: line.ts || Date.now() });
+        // 控制長度避免內存過大
+        if (room.transcript.length > 5000) {
+            room.transcript = room.transcript.slice(-4000);
+        }
+        return room.transcript;
+    },
+    getTranscript(roomId) {
+        const room = this.getRoom(roomId);
+        return room.transcript;
     }
 };
 
@@ -533,7 +548,8 @@ io.on('connection', (socket) => {
                     creatorName: username,
                     createdAt: new Date()
                 } : null),
-                isCreator
+                isCreator,
+                transcript: memoryStorage.getTranscript(roomId)
             });
             
             // 通知房间其他用户新用户加入
@@ -665,6 +681,14 @@ io.on('connection', (socket) => {
     socket.on('transcript-update', (data) => {
         try {
             const { roomId } = data;
+            // 寫入內存歷史
+            memoryStorage.addTranscriptLine(roomId, {
+                userId: data.userId,
+                username: data.username,
+                text: data.text,
+                final: !!data.final,
+                ts: data.ts || Date.now()
+            });
             socket.to(roomId).emit('transcript-update', data);
         } catch (error) {
             console.error('transcript-update 廣播失敗:', error);
@@ -854,6 +878,33 @@ app.get('/api/rooms/:roomId/participants', async (req, res) => {
     } catch (error) {
         console.error('获取参与者失败:', error);
         res.status(500).json({ error: '获取参与者失败' });
+    }
+});
+
+// 取得字幕（JSON）
+app.get('/api/rooms/:roomId/transcript', (req, res) => {
+    try {
+        const { roomId } = req.params;
+        const transcript = memoryStorage.getTranscript(roomId) || [];
+        res.json({ transcript });
+    } catch (error) {
+        console.error('获取字幕失败:', error);
+        res.status(500).json({ error: '获取字幕失败' });
+    }
+});
+
+// 下載字幕（純文字）
+app.get('/api/rooms/:roomId/transcript.txt', (req, res) => {
+    try {
+        const { roomId } = req.params;
+        const transcript = memoryStorage.getTranscript(roomId) || [];
+        const lines = transcript.map(l => `${l.username || l.userId}: ${l.text}`);
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${roomId}-transcript.txt"`);
+        res.send(lines.join('\n'));
+    } catch (error) {
+        console.error('下载字幕失败:', error);
+        res.status(500).send('下载字幕失败');
     }
 });
 

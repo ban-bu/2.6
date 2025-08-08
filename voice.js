@@ -14,6 +14,7 @@
   const ui = {
     btnToggleVoice: document.getElementById('btnToggleVoice'),
     btnToggleTranscribe: document.getElementById('btnToggleTranscribe'),
+    btnDownloadTranscript: document.getElementById('btnDownloadTranscript'),
     transcriptContainer: document.getElementById('transcriptContainer'),
     transcriptContent: document.getElementById('transcriptContent'),
   };
@@ -132,6 +133,11 @@
     ui.transcriptContent.scrollTop = ui.transcriptContent.scrollHeight;
   }
 
+  function renderTranscriptHistory(lines = []) {
+    ui.transcriptContent.innerHTML = '';
+    lines.forEach((l) => renderTranscriptLine(l));
+  }
+
   // ===== 轉寫：科大訊飛 =====
   let rtasr = null;
   async function ensureRtasr() {
@@ -156,6 +162,10 @@
   }
 
   function onTranscriptUpdateFromRemote(data) {
+    // 若未顯示，首次收到也自動打開字幕區
+    if (ui.transcriptContainer.style.display === 'none') {
+      ui.transcriptContainer.style.display = 'block';
+    }
     renderTranscriptLine(data);
   }
 
@@ -222,13 +232,64 @@
     else await startTranscribe();
   });
 
-  // 與實時通訊層銜接
-  window.realtimeClient?.setEventHandlers({
-    ...(window.realtimeClient?._handlers || {}),
-    onWebRTCSignal: handleWebRTCSignal,
-    onVoiceParticipants,
-    onTranscriptUpdate: onTranscriptUpdateFromRemote,
+  // 下載字幕
+  function downloadTranscript() {
+    const text = Array.from(ui.transcriptContent.children)
+      .map((el) => el.textContent)
+      .join('\n');
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const room = state.roomId || 'room';
+    a.download = `${room}-transcript.txt`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 0);
+  }
+
+  ui.btnDownloadTranscript?.addEventListener('click', () => {
+    if (state.roomId) {
+      // 直接使用後端端點，確保抓到完整歷史
+      const a = document.createElement('a');
+      a.href = `/api/rooms/${state.roomId}/transcript.txt`;
+      a.download = `${state.roomId}-transcript.txt`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } else {
+      downloadTranscript();
+    }
   });
+
+  // 與實時通訊層銜接
+  // 將 setEventHandlers 包一層，確保任何後續註冊都會保留語音/字幕處理
+  if (window.realtimeClient && !window.realtimeClient._voicePatched) {
+    const client = window.realtimeClient;
+    const original = client.setEventHandlers.bind(client);
+    client.setEventHandlers = function (handlers) {
+      // 先讓外部註冊
+      original(handlers);
+      // 取得當前 onRoomData，包裝一次
+      const prevOnRoomData = this._handlers.onRoomData;
+      original({
+        onWebRTCSignal: handleWebRTCSignal,
+        onVoiceParticipants,
+        onTranscriptUpdate: onTranscriptUpdateFromRemote,
+        onRoomData: (data) => {
+          if (data?.transcript && data.transcript.length) {
+            ui.transcriptContainer.style.display = 'block';
+            renderTranscriptHistory(data.transcript);
+          }
+          prevOnRoomData && prevOnRoomData(data);
+        },
+      });
+    };
+    client._voicePatched = true;
+  }
 })();
 
 
