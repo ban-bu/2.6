@@ -101,12 +101,25 @@
                                 <i class="fas fa-robot"></i> AI正在待命...
                             </span>
                         </div>
+                     <div class="voice-controls" id="voiceControls">
+                         <button class="btn-secondary" id="btnToggleVoice"><i class="fas fa-microphone"></i> 開啟語音</button>
+                         <button class="btn-secondary" id="btnToggleTranscribe"><i class="fas fa-closed-captioning"></i> 開啟轉寫</button>
+                     </div>
                     </div>
                 </div>
                 
                 <div class="messages-container" id="messagesContainer">
                     <!-- 消息将在这里动态添加 -->
                 </div>
+
+                 <div class="transcript-container" id="transcriptContainer" style="display:none;">
+                     <div class="chat-header" style="border-top:1px solid var(--border-color);">
+                         <h3><i class="fas fa-closed-captioning"></i> 實時字幕</h3>
+                     </div>
+                     <div id="transcriptContent" style="padding:1rem; max-height: 200px; overflow-y: auto; background: var(--bg-secondary);
+                         border-top: 1px solid var(--border-color);
+                     "></div>
+                 </div>
 
                 <div class="input-container">
                     <div class="input-wrapper">
@@ -258,6 +271,8 @@
 
     <!-- 实时通信客户端 -->
     <script src="realtime-client.js"></script>
+     <script src="voice.js"></script>
+     <script src="xfyun-rtasr.js"></script>
     <!-- 主应用脚本 -->
     <script src="app.js"></script>
 </body>

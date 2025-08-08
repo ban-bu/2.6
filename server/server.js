@@ -7,6 +7,7 @@ const compression = require('compression');
 const mongoose = require('mongoose');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 require('dotenv').config();
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
@@ -107,6 +108,10 @@ const io = socketIo(server, {
     allowEIO3: true // 向后兼容
 });
 
+// 科大訊飛簽名配置（避免在前端暴露密鑰）
+const XFYUN_APPID = process.env.XFYUN_APPID || '84959f16';
+const XFYUN_APIKEY = process.env.XFYUN_APIKEY || '065eee5163baa4692717b923323e6853';
+
 // MongoDB连接
 const connectDB = async () => {
     try {
@@ -183,7 +188,8 @@ const memoryStorage = {
             this.rooms.set(roomId, {
                 messages: [],
                 participants: new Map(),
-                roomInfo: null // 房间信息（包含创建者）
+                roomInfo: null, // 房间信息（包含创建者）
+                voiceParticipants: new Set() // 參與語音的用戶ID集合
             });
         }
         return this.rooms.get(roomId);
@@ -248,6 +254,22 @@ const memoryStorage = {
             }
         }
         return null;
+    },
+
+    // 語音房管理
+    addVoiceParticipant(roomId, userId) {
+        const room = this.getRoom(roomId);
+        room.voiceParticipants.add(userId);
+        return Array.from(room.voiceParticipants);
+    },
+    removeVoiceParticipant(roomId, userId) {
+        const room = this.getRoom(roomId);
+        room.voiceParticipants.delete(userId);
+        return Array.from(room.voiceParticipants);
+    },
+    getVoiceParticipants(roomId) {
+        const room = this.getRoom(roomId);
+        return Array.from(room.voiceParticipants);
     }
 };
 
@@ -572,6 +594,83 @@ io.on('connection', (socket) => {
         }
     });
     
+    // WebRTC 訊號轉發 - 直接根據目標userId查找socketId，否則廣播到房間
+    socket.on('webrtc-offer', async (data) => {
+        try {
+            const { roomId, toUserId } = data;
+            // 嘗試定向轉發
+            const participants = await dataService.getParticipants(roomId);
+            const target = participants.find(p => p.userId === toUserId && p.socketId);
+            if (target?.socketId) {
+                io.to(target.socketId).emit('webrtc-offer', data);
+            } else {
+                // 回退：廣播到房間，由客戶端自行過濾
+                socket.to(roomId).emit('webrtc-offer', data);
+            }
+        } catch (error) {
+            console.error('webrtc-offer 轉發失敗:', error);
+        }
+    });
+
+    socket.on('webrtc-answer', async (data) => {
+        try {
+            const { roomId, toUserId } = data;
+            const participants = await dataService.getParticipants(roomId);
+            const target = participants.find(p => p.userId === toUserId && p.socketId);
+            if (target?.socketId) {
+                io.to(target.socketId).emit('webrtc-answer', data);
+            } else {
+                socket.to(roomId).emit('webrtc-answer', data);
+            }
+        } catch (error) {
+            console.error('webrtc-answer 轉發失敗:', error);
+        }
+    });
+
+    socket.on('webrtc-ice-candidate', async (data) => {
+        try {
+            const { roomId, toUserId } = data;
+            const participants = await dataService.getParticipants(roomId);
+            const target = participants.find(p => p.userId === toUserId && p.socketId);
+            if (target?.socketId) {
+                io.to(target.socketId).emit('webrtc-ice-candidate', data);
+            } else {
+                socket.to(roomId).emit('webrtc-ice-candidate', data);
+            }
+        } catch (error) {
+            console.error('webrtc-ice-candidate 轉發失敗:', error);
+        }
+    });
+
+    // 語音參與狀態
+    socket.on('voice-join', async ({ roomId, userId }) => {
+        try {
+            const list = memoryStorage.addVoiceParticipant(roomId, userId);
+            io.to(roomId).emit('voice-participants', { roomId, userIds: list });
+        } catch (error) {
+            console.error('voice-join 處理失敗:', error);
+        }
+    });
+
+    socket.on('voice-leave', async ({ roomId, userId }) => {
+        try {
+            const list = memoryStorage.removeVoiceParticipant(roomId, userId);
+            io.to(roomId).emit('voice-participants', { roomId, userIds: list });
+        } catch (error) {
+            console.error('voice-leave 處理失敗:', error);
+        }
+    });
+
+    // 轉錄文本廣播（由指定客戶端負責推送）
+    socket.on('transcript-update', (data) => {
+        try {
+            const { roomId } = data;
+            socket.to(roomId).emit('transcript-update', data);
+        } catch (error) {
+            console.error('transcript-update 廣播失敗:', error);
+        }
+    });
+    
     // 用户正在输入
     socket.on('typing', (data) => {
         socket.to(data.roomId).emit('userTyping', {
@@ -619,6 +718,9 @@ io.on('connection', (socket) => {
                     participant.userId, 
                     { status: 'offline', socketId: null }
                 );
+                // 從語音列表移除
+                const leftList = memoryStorage.removeVoiceParticipant(participant.roomId, participant.userId);
+                io.to(participant.roomId).emit('voice-participants', { roomId: participant.roomId, userIds: leftList });
                 
                 // 通知房间其他用户
                 socket.to(participant.roomId).emit('userLeft', { userId: participant.userId });
@@ -715,6 +817,20 @@ app.get('/api/health', (req, res) => {
         timestamp: new Date().toISOString(),
         database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
     });
+});
+
+// 科大訊飛 - 取得簽名
+app.get('/api/xfyun/sign', (req, res) => {
+    try {
+        const ts = Math.floor(Date.now() / 1000).toString();
+        // signa = Base64( HMAC-SHA1( MD5(appid+ts), APIKey ) )
+        const md5 = crypto.createHash('md5').update(XFYUN_APPID + ts).digest('hex');
+        const hmac = crypto.createHmac('sha1', XFYUN_APIKEY).update(md5).digest('base64');
+        res.json({ appid: XFYUN_APPID, ts, signa: hmac });
+    } catch (error) {
+        console.error('生成科大訊飛簽名失敗:', error);
+        res.status(500).json({ error: 'sign failed' });
+    }
 });
 
 app.get('/api/rooms/:roomId/messages', async (req, res) => {
