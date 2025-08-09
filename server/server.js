@@ -6,6 +6,8 @@ const helmet = require('helmet');
 const compression = require('compression');
 const mongoose = require('mongoose');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
+const WebSocket = require('ws');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -106,6 +108,214 @@ const io = socketIo(server, {
     transports: ['websocket', 'polling'], // 支持多种传输方式
     allowEIO3: true // 向后兼容
 });
+
+// ============== 语音通话与转写（内存态） ==============
+const voiceRooms = new Map(); // roomId -> Set<userId>
+const asrSessions = new Map(); // IAT: roomId -> { ws, isReady, queue: Buffer[], disabled?: boolean }
+const rtasrSessions = new Map(); // RTASR: roomId -> { ws, started, queue: Buffer[] }
+
+function getVoiceSet(roomId) {
+    if (!voiceRooms.has(roomId)) {
+        voiceRooms.set(roomId, new Set());
+    }
+    return voiceRooms.get(roomId);
+}
+
+// 科大讯飞配置
+const IFLYTEK_APPID = process.env.IFLYTEK_APPID || '84959f16';
+const IFLYTEK_API_KEY = process.env.IFLYTEK_API_KEY || '065eee5163baa4692717b923323e6853';
+const IFLYTEK_API_SECRET = process.env.IFLYTEK_API_SECRET || process.env.XFY_API_SECRET || '';
+const IFLYTEK_MODE = (process.env.IFLYTEK_MODE || 'rtasr').toLowerCase(); // 'rtasr' | 'iat'
+
+function buildIatAuthUrl() {
+    const host = 'iat-api.xfyun.cn';
+    const path = '/v2/iat';
+    const date = new Date().toGMTString();
+    const signatureOrigin = `host: ${host}\ndate: ${date}\nGET ${path} HTTP/1.1`;
+    const signatureSha = crypto.createHmac('sha256', IFLYTEK_API_SECRET).update(signatureOrigin).digest('base64');
+    const authorizationOrigin = `api_key=${IFLYTEK_API_KEY}, algorithm=hmac-sha256, headers=host date request-line, signature=${signatureSha}`;
+    const authorization = Buffer.from(authorizationOrigin).toString('base64');
+    const url = `wss://${host}${path}?authorization=${authorization}&date=${encodeURIComponent(date)}&host=${host}`;
+    return url;
+}
+
+function ensureAsrSession(roomId) {
+    if (asrSessions.has(roomId)) return asrSessions.get(roomId);
+    if (!IFLYTEK_API_SECRET) {
+        console.warn('IFLYTEK_API_SECRET 未配置，禁用实时转写');
+        const disabled = { ws: null, isReady: false, disabled: true, queue: [] };
+        asrSessions.set(roomId, disabled);
+        return disabled;
+    }
+
+    const url = buildIatAuthUrl();
+    const ws = new WebSocket(url);
+    const session = { ws, isReady: false, queue: [] };
+    asrSessions.set(roomId, session);
+
+    ws.on('open', () => {
+        session.isReady = true;
+        const frame = {
+            common: { app_id: IFLYTEK_APPID },
+            business: {
+                language: 'zh_cn',
+                domain: 'iat',
+                accent: 'mandarin',
+                dwa: 'wpgs',
+                vad_eos: 3000,
+                ptt: 0
+            },
+            data: {
+                status: 0,
+                format: 'audio/L16;rate=16000',
+                encoding: 'raw',
+                audio: ''
+            }
+        };
+        ws.send(JSON.stringify(frame));
+        while (session.queue.length) {
+            const chunk = session.queue.shift();
+            sendAudioChunk(ws, chunk, 1);
+        }
+    });
+
+    ws.on('message', (msg) => {
+        try {
+            const data = JSON.parse(msg.toString());
+            if (data && data.code === 0 && data.data && data.data.result) {
+                const wpgs = data.data.result.ws || [];
+                const text = wpgs.map(w => w.cw.map(c => c.w).join('')).join('');
+                if (text) {
+                    io.to(roomId).emit('transcript', { text, isFinal: data.data.status === 2 });
+                }
+            } else if (data && data.code !== 0) {
+                console.error('讯飞ASR错误:', data.code, data.message);
+            }
+        } catch (e) {
+            // ignore
+        }
+    });
+
+    ws.on('close', () => {
+        asrSessions.delete(roomId);
+    });
+
+    ws.on('error', (err) => {
+        console.error('讯飞ASR连接错误:', err.message);
+    });
+
+    return session;
+}
+
+function sendAudioChunk(ws, rawPcmBuffer, status) {
+    const frame = {
+        data: {
+            status,
+            format: 'audio/L16;rate=16000',
+            encoding: 'raw',
+            audio: rawPcmBuffer.toString('base64')
+        }
+    };
+    ws.send(JSON.stringify(frame));
+}
+
+// ============== RTASR（rtasr.xfyun.cn） ==============
+function md5Hex(input) {
+    return crypto.createHash('md5').update(input, 'utf8').digest('hex');
+}
+
+function buildRtasrAuthUrl() {
+    const host = 'rtasr.xfyun.cn';
+    const path = '/v1/ws';
+    const ts = Math.floor(Date.now() / 1000).toString();
+    const signaRaw = md5Hex(IFLYTEK_APPID + ts);
+    const signa = crypto.createHmac('sha1', IFLYTEK_API_SECRET).update(signaRaw).digest('base64');
+    const qs = `?appid=${encodeURIComponent(IFLYTEK_APPID)}&ts=${encodeURIComponent(ts)}&signa=${encodeURIComponent(signa)}`;
+    const url = `wss://${host}${path}${qs}`;
+    return { url, host };
+}
+
+function ensureRtasrSession(roomId) {
+    if (rtasrSessions.has(roomId)) return rtasrSessions.get(roomId);
+    if (!IFLYTEK_API_SECRET) {
+        console.warn('IFLYTEK_API_SECRET 未配置，禁用RTASR转写');
+        const disabled = { ws: null, started: false, disabled: true, queue: [] };
+        rtasrSessions.set(roomId, disabled);
+        return disabled;
+    }
+
+    const { url, host } = buildRtasrAuthUrl();
+    const ws = new WebSocket(url, { headers: { Origin: `https://${host}` } });
+    const session = { ws, started: false, queue: [] };
+    rtasrSessions.set(roomId, session);
+
+    ws.on('open', () => {
+        // 等待服务端返回 started 后再发送队列
+    });
+
+    ws.on('message', (msg) => {
+        let text;
+        if (Buffer.isBuffer(msg)) {
+            try { text = msg.toString('utf8'); } catch { return; }
+        } else {
+            text = String(msg);
+        }
+        try {
+            const data = JSON.parse(text);
+            const action = data.action;
+            if (action === 'started') {
+                session.started = true;
+                // 发送缓存的音频
+                while (session.queue.length) {
+                    const chunk = session.queue.shift();
+                    try { ws.send(chunk); } catch {}
+                }
+            } else if (action === 'result') {
+                // 提取文本
+                const content = extractRtasrText(data.data);
+                if (content) {
+                    io.to(roomId).emit('transcript', { text: content, isFinal: false });
+                }
+            } else if (action === 'error') {
+                console.error('RTASR错误:', data);
+            }
+        } catch {
+            // 非JSON忽略
+        }
+    });
+
+    ws.on('close', () => {
+        rtasrSessions.delete(roomId);
+    });
+
+    ws.on('error', (err) => {
+        console.error('RTASR连接错误:', err.message);
+    });
+
+    return session;
+}
+
+function extractRtasrText(messageStr) {
+    try {
+        const messageObj = typeof messageStr === 'string' ? JSON.parse(messageStr) : messageStr;
+        const cn = messageObj.cn;
+        const st = cn && cn.st;
+        const rtArr = (st && st.rt) || [];
+        let result = '';
+        for (const rt of rtArr) {
+            const wsArr = rt.ws || [];
+            for (const wsItem of wsArr) {
+                const cwArr = wsItem.cw || [];
+                for (const cw of cwArr) {
+                    result += cw.w || '';
+                }
+            }
+        }
+        return result;
+    } catch (e) {
+        return '';
+    }
+}
 
 // MongoDB连接
 const connectDB = async () => {
@@ -632,6 +842,104 @@ io.on('connection', (socket) => {
         }
     });
     
+    // ============ 语音通话信令与状态 ============
+    socket.on('voice-join', async ({ roomId, userId }) => {
+        try {
+            const set = getVoiceSet(roomId);
+            set.add(userId);
+            socket.emit('voice-users', Array.from(set));
+            socket.to(roomId).emit('voice-user-joined', { userId });
+        } catch (e) {
+            console.error('voice-join失败:', e);
+        }
+    });
+
+    socket.on('voice-leave', ({ roomId, userId }) => {
+        try {
+            const set = getVoiceSet(roomId);
+            set.delete(userId);
+            socket.to(roomId).emit('voice-user-left', { userId });
+        } catch (e) {
+            console.error('voice-leave失败:', e);
+        }
+    });
+
+    // WebRTC 信令转发
+    async function forwardToTarget(roomId, toUserId, event, payload) {
+        try {
+            const participants = await dataService.getParticipants(roomId);
+            const target = participants.find(p => p.userId === toUserId);
+            if (target && target.socketId) {
+                io.to(target.socketId).emit(event, payload);
+            }
+        } catch (e) {
+            console.error('信令转发失败:', e);
+        }
+    }
+
+    socket.on('webrtc-offer', ({ roomId, fromUserId, toUserId, sdp }) => {
+        forwardToTarget(roomId, toUserId, 'webrtc-offer', { roomId, fromUserId, sdp });
+    });
+
+    socket.on('webrtc-answer', ({ roomId, fromUserId, toUserId, sdp }) => {
+        forwardToTarget(roomId, toUserId, 'webrtc-answer', { roomId, fromUserId, sdp });
+    });
+
+    socket.on('webrtc-ice-candidate', ({ roomId, fromUserId, toUserId, candidate }) => {
+        forwardToTarget(roomId, toUserId, 'webrtc-ice-candidate', { roomId, fromUserId, candidate });
+    });
+
+    // ============ 科大讯飞 实时转写 ============
+    socket.on('asr-start', ({ roomId }) => {
+        if (IFLYTEK_MODE === 'rtasr') {
+            ensureRtasrSession(roomId);
+        } else {
+            ensureAsrSession(roomId);
+        }
+    });
+
+    socket.on('audio-chunk', ({ roomId, chunkBase64, isLast }) => {
+        if (IFLYTEK_MODE === 'rtasr') {
+            const session = ensureRtasrSession(roomId);
+            if (!session || session.disabled) return;
+            const buf = Buffer.from(chunkBase64, 'base64');
+            if (session.ws) {
+                if (session.started) {
+                    try { session.ws.send(buf); } catch {}
+                } else {
+                    session.queue.push(buf);
+                }
+            }
+            if (isLast && session.ws) {
+                try { session.ws.send(Buffer.from('{"end": true}', 'utf8')); } catch {}
+            }
+        } else {
+            const session = ensureAsrSession(roomId);
+            if (!session || session.disabled) return;
+            const buf = Buffer.from(chunkBase64, 'base64');
+            if (session.ws && session.isReady) {
+                sendAudioChunk(session.ws, buf, isLast ? 2 : 1);
+            } else {
+                session.queue.push(buf);
+            }
+        }
+    });
+
+    socket.on('asr-stop', ({ roomId }) => {
+        if (IFLYTEK_MODE === 'rtasr') {
+            const session = rtasrSessions.get(roomId);
+            if (session && session.ws) {
+                try { session.ws.close(); } catch {}
+            }
+            rtasrSessions.delete(roomId);
+        } else {
+            const session = asrSessions.get(roomId);
+            if (session && session.ws) {
+                try { session.ws.close(); } catch {}
+            }
+            asrSessions.delete(roomId);
+        }
+    });
     // 结束会议（仅创建者可操作）
     socket.on('endMeeting', async (data) => {
         try {
@@ -704,255 +1012,6 @@ io.on('connection', (socket) => {
         } catch (error) {
             console.error('结束会议失败:', error);
             socket.emit('error', '结束会议失败: ' + error.message);
-        }
-    });
-    
-    // ==================== 语音通话功能 ====================
-    
-    // 开始语音通话
-    socket.on('voice-call-start', async (data) => {
-        try {
-            const { roomId, userId, username } = data;
-            console.log(`用户 ${username} 在房间 ${roomId} 开始语音通话`);
-            
-            // 加入语音通话房间
-            socket.join(`voice-${roomId}`);
-            
-            // 通知房间内其他用户有新用户加入语音通话
-            socket.to(roomId).emit('voice-call-user-joined', {
-                userId,
-                username,
-                socketId: socket.id
-            });
-            
-            // 发送当前房间内所有进行语音通话的用户列表给新加入的用户
-            const roomSockets = await io.in(`voice-${roomId}`).fetchSockets();
-            const voiceUsers = [];
-            
-            for (const roomSocket of roomSockets) {
-                if (roomSocket.id !== socket.id) {
-                    // 获取用户信息
-                    const participant = await dataService.findParticipantBySocketId(roomSocket.id);
-                    if (participant) {
-                        voiceUsers.push({
-                            userId: participant.userId,
-                            username: participant.name,
-                            socketId: roomSocket.id
-                        });
-                    }
-                }
-            }
-            
-            // 发送现有语音用户列表给新用户
-            socket.emit('voice-call-existing-users', voiceUsers);
-            
-        } catch (error) {
-            console.error('开始语音通话失败:', error);
-            socket.emit('error', '开始语音通话失败');
-        }
-    });
-    
-    // 结束语音通话
-    socket.on('voice-call-end', async (data) => {
-        try {
-            const { roomId, userId } = data;
-            console.log(`用户 ${userId} 结束语音通话`);
-            
-            // 离开语音通话房间
-            socket.leave(`voice-${roomId}`);
-            
-            // 通知房间内其他用户该用户离开语音通话
-            socket.to(roomId).emit('voice-call-user-left', {
-                userId,
-                socketId: socket.id
-            });
-            
-        } catch (error) {
-            console.error('结束语音通话失败:', error);
-        }
-    });
-    
-    // WebRTC信令：发送offer
-    socket.on('voice-call-offer', (data) => {
-        try {
-            const { roomId, targetUserId, offer } = data;
-            console.log(`转发offer: ${socket.id} -> ${targetUserId}`);
-            
-            // 找到目标用户的socket并转发offer
-            const participant = dataService.findParticipantBySocketId(socket.id);
-            const targetSockets = io.sockets.sockets;
-            
-            for (const [socketId, targetSocket] of targetSockets) {
-                if (targetSocket.rooms.has(roomId)) {
-                    const targetParticipant = dataService.findParticipantBySocketId(socketId);
-                    if (targetParticipant && targetParticipant.userId === targetUserId) {
-                        targetSocket.emit('voice-call-offer', {
-                            fromUserId: participant ? participant.userId : socket.id,
-                            offer: offer
-                        });
-                        break;
-                    }
-                }
-            }
-            
-        } catch (error) {
-            console.error('转发offer失败:', error);
-        }
-    });
-    
-    // WebRTC信令：发送answer
-    socket.on('voice-call-answer', (data) => {
-        try {
-            const { roomId, targetUserId, answer } = data;
-            console.log(`转发answer: ${socket.id} -> ${targetUserId}`);
-            
-            // 找到目标用户的socket并转发answer
-            const participant = dataService.findParticipantBySocketId(socket.id);
-            const targetSockets = io.sockets.sockets;
-            
-            for (const [socketId, targetSocket] of targetSockets) {
-                if (targetSocket.rooms.has(roomId)) {
-                    const targetParticipant = dataService.findParticipantBySocketId(socketId);
-                    if (targetParticipant && targetParticipant.userId === targetUserId) {
-                        targetSocket.emit('voice-call-answer', {
-                            fromUserId: participant ? participant.userId : socket.id,
-                            answer: answer
-                        });
-                        break;
-                    }
-                }
-            }
-            
-        } catch (error) {
-            console.error('转发answer失败:', error);
-        }
-    });
-    
-    // WebRTC信令：发送ICE候选
-    socket.on('voice-call-ice-candidate', (data) => {
-        try {
-            const { roomId, targetUserId, candidate } = data;
-            
-            // 找到目标用户的socket并转发ICE候选
-            const participant = dataService.findParticipantBySocketId(socket.id);
-            const targetSockets = io.sockets.sockets;
-            
-            for (const [socketId, targetSocket] of targetSockets) {
-                if (targetSocket.rooms.has(roomId)) {
-                    const targetParticipant = dataService.findParticipantBySocketId(socketId);
-                    if (targetParticipant && targetParticipant.userId === targetUserId) {
-                        targetSocket.emit('voice-call-ice-candidate', {
-                            fromUserId: participant ? participant.userId : socket.id,
-                            candidate: candidate
-                        });
-                        break;
-                    }
-                }
-            }
-            
-        } catch (error) {
-            console.error('转发ICE候选失败:', error);
-        }
-    });
-    
-    // 语音通话静音状态更新
-    socket.on('voice-call-mute-status', (data) => {
-        try {
-            const { roomId, userId, isMuted } = data;
-            
-            // 转发静音状态给房间内其他用户
-            socket.to(roomId).emit('voice-call-mute-status', {
-                userId,
-                isMuted
-            });
-            
-        } catch (error) {
-            console.error('更新静音状态失败:', error);
-        }
-    });
-    
-    // 语音转录消息
-    socket.on('voice-transcription', async (data) => {
-        try {
-            const { roomId, userId, username, text, timestamp, isReplace } = data;
-            console.log(`语音转录 [${username}]: ${text.substring(0, 50)}...`);
-            
-            // 创建转录消息记录
-            const transcriptionMessage = {
-                roomId,
-                type: 'voice-transcription',
-                text: `[语音转录] ${text}`,
-                author: username,
-                userId,
-                time: new Date().toLocaleTimeString('zh-CN', { 
-                    hour: '2-digit', 
-                    minute: '2-digit' 
-                }),
-                timestamp: new Date(timestamp),
-                isTranscription: true,
-                originalText: text
-            };
-            
-            // 保存转录消息到数据库
-            const savedMessage = await dataService.saveMessage(transcriptionMessage);
-            
-            // 转发转录消息给房间内所有用户
-            io.to(roomId).emit('voice-transcription', {
-                userId,
-                username,
-                text,
-                timestamp,
-                isReplace,
-                message: savedMessage
-            });
-            
-            // 同时作为普通消息广播（可选，根据需求决定）
-            // io.to(roomId).emit('newMessage', savedMessage);
-            
-        } catch (error) {
-            console.error('处理语音转录失败:', error);
-        }
-    });
-    
-    // 处理断开连接时的语音通话清理
-    const originalDisconnectHandler = socket.listeners('disconnect')[0];
-    socket.removeAllListeners('disconnect');
-    
-    socket.on('disconnect', async () => {
-        try {
-            console.log('用户断开连接:', socket.id);
-            
-            // 查找该socket对应的参与者
-            const participant = await dataService.findParticipantBySocketId(socket.id);
-            if (participant) {
-                // 清理语音通话相关资源
-                const voiceRoomId = `voice-${participant.roomId}`;
-                if (socket.rooms.has(voiceRoomId)) {
-                    socket.leave(voiceRoomId);
-                    
-                    // 通知房间内其他用户该用户离开语音通话
-                    socket.to(participant.roomId).emit('voice-call-user-left', {
-                        userId: participant.userId,
-                        socketId: socket.id
-                    });
-                }
-                
-                // 执行原有的断开连接处理逻辑
-                await dataService.updateParticipant(
-                    participant.roomId, 
-                    participant.userId, 
-                    { status: 'offline', socketId: null }
-                );
-                
-                // 通知房间其他用户
-                socket.to(participant.roomId).emit('userLeft', { userId: participant.userId });
-                
-                // 更新参与者列表
-                const participants = await dataService.getParticipants(participant.roomId);
-                io.to(participant.roomId).emit('participantsUpdate', participants);
-            }
-        } catch (error) {
-            console.error('处理断开连接失败:', error);
         }
     });
 });

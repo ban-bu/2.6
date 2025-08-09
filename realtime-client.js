@@ -22,6 +22,14 @@ class RealtimeClient {
         this.onError = null;
         this.onRoomData = null;
         this.onUserTyping = null;
+        // 语音/转写
+        this.onVoiceUsers = null;
+        this.onVoiceUserJoined = null;
+        this.onVoiceUserLeft = null;
+        this.onWebrtcOffer = null;
+        this.onWebrtcAnswer = null;
+        this.onWebrtcIceCandidate = null;
+        this.onTranscript = null;
         
         // 检测运行环境
         this.isHuggingFace = window.location.hostname.includes('huggingface.co');
@@ -212,11 +220,6 @@ class RealtimeClient {
             
             showToast('实时连接已建立', 'success');
             
-            // 重新设置语音功能事件监听器
-            if (typeof onRealtimeClientConnected === 'function') {
-                onRealtimeClientConnected();
-            }
-            
             // 如果已经有房间信息，重新加入
             if (this.currentRoomId && this.currentUserId && this.currentUsername) {
                 this.joinRoom(this.currentRoomId, this.currentUserId, this.currentUsername);
@@ -312,6 +315,15 @@ class RealtimeClient {
                 this.onEndMeetingSuccess(data);
             }
         });
+
+        // ========= 语音 & WebRTC =========
+        this.socket.on('voice-users', (users) => this.onVoiceUsers && this.onVoiceUsers(users));
+        this.socket.on('voice-user-joined', (data) => this.onVoiceUserJoined && this.onVoiceUserJoined(data));
+        this.socket.on('voice-user-left', (data) => this.onVoiceUserLeft && this.onVoiceUserLeft(data));
+        this.socket.on('webrtc-offer', (payload) => this.onWebrtcOffer && this.onWebrtcOffer(payload));
+        this.socket.on('webrtc-answer', (payload) => this.onWebrtcAnswer && this.onWebrtcAnswer(payload));
+        this.socket.on('webrtc-ice-candidate', (payload) => this.onWebrtcIceCandidate && this.onWebrtcIceCandidate(payload));
+        this.socket.on('transcript', (payload) => this.onTranscript && this.onTranscript(payload));
     }
     
     handleConnectionError(error) {
@@ -397,6 +409,14 @@ class RealtimeClient {
         this.onUserTyping = handlers.onUserTyping;
         this.onMeetingEnded = handlers.onMeetingEnded;
         this.onEndMeetingSuccess = handlers.onEndMeetingSuccess;
+        // 语音/转写
+        this.onVoiceUsers = handlers.onVoiceUsers;
+        this.onVoiceUserJoined = handlers.onVoiceUserJoined;
+        this.onVoiceUserLeft = handlers.onVoiceUserLeft;
+        this.onWebrtcOffer = handlers.onWebrtcOffer;
+        this.onWebrtcAnswer = handlers.onWebrtcAnswer;
+        this.onWebrtcIceCandidate = handlers.onWebrtcIceCandidate;
+        this.onTranscript = handlers.onTranscript;
     }
     
     // 状态查询
@@ -420,6 +440,55 @@ class RealtimeClient {
         this.currentRoomId = null;
         this.currentUserId = null;
         this.currentUsername = null;
+    }
+
+    // ========= 语音 & 转写 API =========
+    voiceJoin(roomId, userId) {
+        if (this.isConnected && this.socket) {
+            this.socket.emit('voice-join', { roomId, userId });
+        }
+    }
+
+    voiceLeave(roomId, userId) {
+        if (this.isConnected && this.socket) {
+            this.socket.emit('voice-leave', { roomId, userId });
+        }
+    }
+
+    sendOffer(roomId, fromUserId, toUserId, sdp) {
+        if (this.isConnected && this.socket) {
+            this.socket.emit('webrtc-offer', { roomId, fromUserId, toUserId, sdp });
+        }
+    }
+
+    sendAnswer(roomId, fromUserId, toUserId, sdp) {
+        if (this.isConnected && this.socket) {
+            this.socket.emit('webrtc-answer', { roomId, fromUserId, toUserId, sdp });
+        }
+    }
+
+    sendIceCandidate(roomId, fromUserId, toUserId, candidate) {
+        if (this.isConnected && this.socket) {
+            this.socket.emit('webrtc-ice-candidate', { roomId, fromUserId, toUserId, candidate });
+        }
+    }
+
+    asrStart(roomId) {
+        if (this.isConnected && this.socket) {
+            this.socket.emit('asr-start', { roomId });
+        }
+    }
+
+    sendAudioChunk(roomId, base64Data, isLast) {
+        if (this.isConnected && this.socket) {
+            this.socket.emit('audio-chunk', { roomId, chunkBase64: base64Data, isLast: !!isLast });
+        }
+    }
+
+    asrStop(roomId) {
+        if (this.isConnected && this.socket) {
+            this.socket.emit('asr-stop', { roomId });
+        }
     }
 }
 

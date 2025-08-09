@@ -20,6 +20,14 @@ let isAIProcessing = false;
 let currentUsername = '';
 let roomId = '';
 let currentUserId = '';
+// 语音通话与转写状态
+let isVoiceOn = false;
+let isTranscriptOn = false;
+let localStream = null;
+let peers = new Map(); // userId -> RTCPeerConnection
+let audioElements = new Map(); // userId -> HTMLAudioElement
+let mediaRecorder = null;
+let mediaRecorderWorker = null; // 备用
 
 // 基于用户名生成一致的用户ID
 function generateUserIdFromUsername(username) {
@@ -791,6 +799,9 @@ function init() {
     showUsernameModal();
     registerServiceWorker();
     setupOfflineIndicator();
+    // 初始化语音按钮可见性
+    const vc = document.getElementById('voiceControls');
+    if (vc) vc.style.display = 'inline-flex';
     
 
     
@@ -852,6 +863,12 @@ function setupEventListeners() {
             searchChatMessages(e.target.value);
         });
     }
+
+    // 语音/转写按钮
+    const btnToggleVoice = document.getElementById('btnToggleVoice');
+    const btnToggleTranscript = document.getElementById('btnToggleTranscript');
+    if (btnToggleVoice) btnToggleVoice.addEventListener('click', toggleVoiceCall);
+    if (btnToggleTranscript) btnToggleTranscript.addEventListener('click', toggleTranscript);
 }
 
 // 处理键盘事件
@@ -1090,6 +1107,63 @@ function setupRealtimeClient() {
         onError: (error) => {
             console.error('实时通信错误:', error);
             showToast(`连接错误: ${error}`, 'error');
+        },
+        // ======== 语音 & 转写 回调 ========
+        onVoiceUsers: (users) => {
+            console.log('当前语音成员:', users);
+            if (!isVoiceOn || !localStream) return;
+            (users || []).forEach(uid => {
+                if (uid && uid !== currentUserId) {
+                    createOrGetPeer(uid, true);
+                }
+            });
+        },
+        onVoiceUserJoined: ({ userId }) => {
+            console.log('语音加入:', userId);
+            if (isVoiceOn) {
+                // 自动向新成员发起连接
+                createOrGetPeer(userId, true);
+            }
+        },
+        onVoiceUserLeft: ({ userId }) => {
+            console.log('语音离开:', userId);
+            const pc = peers.get(userId);
+            if (pc) pc.close();
+            peers.delete(userId);
+            const el = audioElements.get(userId);
+            if (el) el.remove();
+            audioElements.delete(userId);
+        },
+        onWebrtcOffer: async ({ fromUserId, sdp }) => {
+            const pc = createOrGetPeer(fromUserId, false);
+            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            window.realtimeClient.sendAnswer(roomId, currentUserId, fromUserId, pc.localDescription);
+        },
+        onWebrtcAnswer: async ({ fromUserId, sdp }) => {
+            const pc = peers.get(fromUserId);
+            if (pc) await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        },
+        onWebrtcIceCandidate: async ({ fromUserId, candidate }) => {
+            const pc = createOrGetPeer(fromUserId, false);
+            if (candidate) {
+                try { await pc.addIceCandidate(candidate); } catch {}
+            }
+        },
+        onTranscript: ({ text, isFinal }) => {
+            if (!isTranscriptOn) return;
+            const el = document.getElementById('transcriptStream');
+            if (!el) return;
+            el.style.display = 'block';
+            const line = document.createElement('div');
+            line.textContent = (isFinal ? '✓ ' : '… ') + text;
+            el.appendChild(line);
+            el.scrollTop = el.scrollHeight;
+            // 同时作为AI消息广播到聊天区（可选：仅最终结果）
+            if (isFinal) {
+                addMessage('ai', `转写：${text}`, '转写', 'ai-transcript');
+            }
         }
     });
 }
@@ -1342,6 +1416,9 @@ function setUsername() {
         // 然后尝试连接WebSocket获取最新数据
         window.realtimeClient.joinRoom(roomId, currentUserId, username);
         showToast('正在连接实时聊天...', 'info');
+        if (isVoiceOn) {
+            window.realtimeClient.voiceJoin(roomId, currentUserId);
+        }
     } else {
         // 降级到本地模式
         loadRoomData();
@@ -1960,6 +2037,184 @@ ${summaryText}
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+}
+
+// ================= 语音通话与实时转写 =================
+async function toggleVoiceCall() {
+    try {
+        if (!isVoiceOn) {
+            // 打开
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
+            isVoiceOn = true;
+            showToast('已开启群语音', 'success');
+            // 通知服务器加入语音组
+            if (window.realtimeClient && window.realtimeClient.isOnline()) {
+                window.realtimeClient.voiceJoin(roomId, currentUserId);
+            }
+            // 为当前房间的其他成员准备连接（等对方触发/或用户加入事件时再发offer）
+        } else {
+            // 关闭
+            stopAllVoice();
+            showToast('已结束群语音', 'info');
+            if (window.realtimeClient && window.realtimeClient.isOnline()) {
+                window.realtimeClient.voiceLeave(roomId, currentUserId);
+            }
+        }
+        updateVoiceButtons();
+    } catch (e) {
+        console.error(e);
+        showToast('无法开启麦克风，请检查权限设置', 'error');
+    }
+}
+
+function updateVoiceButtons() {
+    const btn = document.getElementById('btnToggleVoice');
+    if (!btn) return;
+    if (isVoiceOn) {
+        btn.innerHTML = '<i class="fas fa-phone-slash"></i> 结束语音';
+    } else {
+        btn.innerHTML = '<i class="fas fa-phone"></i> 群语音';
+    }
+}
+
+function stopAllVoice() {
+    isVoiceOn = false;
+    if (localStream) {
+        localStream.getTracks().forEach(t => t.stop());
+        localStream = null;
+    }
+    peers.forEach(pc => pc.close());
+    peers.clear();
+    audioElements.forEach(el => el.remove());
+    audioElements.clear();
+    stopTranscript();
+}
+
+function createOrGetPeer(remoteUserId, isCaller) {
+    let pc = peers.get(remoteUserId);
+    if (pc) return pc;
+    pc = new RTCPeerConnection({
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+        ]
+    });
+    peers.set(remoteUserId, pc);
+
+    // 本地音轨
+    if (localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    }
+
+    pc.onicecandidate = (e) => {
+        if (e.candidate) {
+            window.realtimeClient && window.realtimeClient.sendIceCandidate(roomId, currentUserId, remoteUserId, e.candidate);
+        }
+    };
+
+    pc.ontrack = (e) => {
+        let el = audioElements.get(remoteUserId);
+        if (!el) {
+            el = document.createElement('audio');
+            el.autoplay = true;
+            el.playsInline = true;
+            el.style.display = 'none';
+            document.body.appendChild(el);
+            audioElements.set(remoteUserId, el);
+        }
+        el.srcObject = e.streams[0];
+    };
+
+    // 发起呼叫
+    if (isCaller) {
+        (async () => {
+            try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                window.realtimeClient && window.realtimeClient.sendOffer(roomId, currentUserId, remoteUserId, pc.localDescription);
+            } catch (err) {
+                console.error('createOffer失败', err);
+            }
+        })();
+    }
+
+    return pc;
+}
+
+function toggleTranscript() {
+    isTranscriptOn = !isTranscriptOn;
+    const el = document.getElementById('btnToggleTranscript');
+    const streamEl = document.getElementById('transcriptStream');
+    if (isTranscriptOn) {
+        if (!isVoiceOn) {
+            // 自动打开语音，确保能采集音频
+            toggleVoiceCall().then(() => startTranscript());
+        } else {
+            startTranscript();
+        }
+        if (el) el.innerHTML = '<i class="fas fa-closed-captioning"></i> 转写中';
+        if (streamEl) streamEl.style.display = 'block';
+    } else {
+        stopTranscript();
+        if (el) el.innerHTML = '<i class="fas fa-closed-captioning"></i> 转写';
+        if (streamEl) streamEl.style.display = 'none';
+    }
+}
+
+function startTranscript() {
+    if (!window.realtimeClient || !window.realtimeClient.isOnline()) return;
+    if (!localStream) return;
+    window.realtimeClient.asrStart(roomId);
+
+    // 将麦克风转为16k PCM并分片发送
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const source = audioCtx.createMediaStreamSource(localStream);
+
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    processor.onaudioprocess = (e) => {
+        if (!isTranscriptOn) return;
+        const input = e.inputBuffer.getChannelData(0);
+        // float32 -> 16-bit PCM
+        const buffer = new ArrayBuffer(input.length * 2);
+        const view = new DataView(buffer);
+        for (let i = 0; i < input.length; i++) {
+            let s = Math.max(-1, Math.min(1, input[i]));
+            view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        }
+        const base64 = arrayBufferToBase64(buffer);
+        window.realtimeClient.sendAudioChunk(roomId, base64, false);
+    };
+
+    // 保存到全局以便停用
+    window.__transcriptAudioCtx = audioCtx;
+    window.__transcriptProcessor = processor;
+}
+
+function stopTranscript() {
+    if (window.__transcriptProcessor) {
+        try { window.__transcriptProcessor.disconnect(); } catch {}
+        window.__transcriptProcessor = null;
+    }
+    if (window.__transcriptAudioCtx) {
+        try { window.__transcriptAudioCtx.close(); } catch {}
+        window.__transcriptAudioCtx = null;
+    }
+    if (window.realtimeClient && window.realtimeClient.isOnline()) {
+        window.realtimeClient.asrStop(roomId);
+    }
+}
+
+function arrayBufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
 }
 
 // 复制房间号

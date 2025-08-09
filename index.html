@@ -7,7 +7,6 @@
     <link rel="stylesheet" href="styles.css">
     <link rel="stylesheet" href="styles-realtime.css">
     <link rel="stylesheet" href="loading.css">
-    <link rel="stylesheet" href="voice-features.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <!-- 使用更快的图标CDN -->
     <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
@@ -36,7 +35,14 @@
                 <button class="btn-secondary" onclick="copyRoomId(event)">
                     <i class="fas fa-copy"></i> 复制房间号
                 </button>
-
+                <div class="voice-controls" id="voiceControls">
+                    <button class="btn-secondary" id="btnToggleVoice" title="开始/结束群语音" onclick="toggleVoiceCall()">
+                        <i class="fas fa-phone"></i> 群语音
+                    </button>
+                    <button class="btn-secondary" id="btnToggleTranscript" title="开启/关闭实时转写" onclick="toggleTranscript()">
+                        <i class="fas fa-closed-captioning"></i> 转写
+                    </button>
+                </div>
             </div>
         </header>
 
@@ -102,56 +108,12 @@
                                 <i class="fas fa-robot"></i> AI正在待命...
                             </span>
                         </div>
-                        <!-- 语音通话控制区域 -->
-                        <div class="voice-call-controls">
-                            <button class="voice-call-btn" id="voiceCallBtn" onclick="toggleVoiceCall()">
-                                <i class="fas fa-phone"></i>
-                                <span id="voiceCallText">语音通话</span>
-                            </button>
-                            <div class="voice-controls" id="voiceControls" style="display: none;">
-                                <button class="voice-control-btn mute-btn" id="muteBtn" onclick="toggleMute()">
-                                    <i class="fas fa-microphone"></i>
-                                </button>
-                                <button class="voice-control-btn speaker-btn" id="speakerBtn" onclick="toggleSpeaker()">
-                                    <i class="fas fa-volume-up"></i>
-                                </button>
-                                <button class="voice-control-btn transcription-btn" id="transcriptionBtn" onclick="toggleTranscription()">
-                                    <i class="fas fa-closed-captioning"></i>
-                                </button>
-                                <div class="voice-volume-control">
-                                    <input type="range" id="volumeSlider" min="0" max="100" value="100" class="volume-slider">
-                                </div>
-                            </div>
-                        </div>
                     </div>
                 </div>
                 
                 <div class="messages-container" id="messagesContainer">
                     <!-- 消息将在这里动态添加 -->
-                </div>
-
-                <!-- 语音转录显示区域 -->
-                <div class="voice-transcription-panel" id="transcriptionPanel" style="display: none;">
-                    <div class="transcription-header">
-                        <h4><i class="fas fa-closed-captioning"></i> 实时语音转录</h4>
-                        <button class="transcription-toggle" onclick="hideTranscription()">
-                            <i class="fas fa-times"></i>
-                        </button>
-                    </div>
-                    <div class="transcription-content" id="transcriptionContent">
-                        <div class="transcription-placeholder">
-                            <i class="fas fa-microphone-alt"></i>
-                            <p>开始语音通话后将显示实时转录...</p>
-                        </div>
-                    </div>
-                    <div class="transcription-controls">
-                        <button class="transcription-control-btn" onclick="clearTranscription()">
-                            <i class="fas fa-eraser"></i> 清空转录
-                        </button>
-                        <button class="transcription-control-btn" onclick="exportTranscription()">
-                            <i class="fas fa-download"></i> 导出转录
-                        </button>
-                    </div>
+                    <div class="transcript-stream" id="transcriptStream" style="display:none;"></div>
                 </div>
 
                 <div class="input-container">
@@ -244,17 +206,6 @@
         </main>
     </div>
 
-    <!-- 语音通话状态指示器 -->
-    <div class="voice-call-status" id="voiceCallStatus">
-        <div class="call-status-header">
-            <div class="call-status-indicator"></div>
-            <span>语音通话进行中</span>
-        </div>
-        <div class="call-participants" id="callParticipants">
-            <!-- 参与通话的用户将在这里显示 -->
-        </div>
-    </div>
-
     <!-- 用户名设置对话框 -->
     <div class="modal" id="usernameModal">
         <div class="modal-content">
@@ -315,8 +266,6 @@
 
     <!-- 实时通信客户端 -->
     <script src="realtime-client.js"></script>
-    <!-- 语音通话功能 -->
-    <script src="voice-call.js"></script>
     <!-- 主应用脚本 -->
     <script src="app.js"></script>
 </body>

@@ -79,6 +79,23 @@ body {
     gap: 1rem;
 }
 
+.voice-controls {
+    display: inline-flex;
+    gap: 0.5rem;
+}
+
+.transcript-stream {
+    position: sticky;
+    top: 0;
+    background: rgba(247, 250, 252, 0.9);
+    border: 1px solid var(--border-color);
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--radius);
+    margin-bottom: 0.75rem;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+}
+
 .room-id {
     font-family: 'Courier New', monospace;
     font-size: 0.875rem;
