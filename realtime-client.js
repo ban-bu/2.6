@@ -12,7 +12,6 @@ class RealtimeClient {
         this.currentRoomId = null;
         this.currentUserId = null;
         this.currentUsername = null;
-        this._handlers = {}; // 用於合併多來源的事件處理器
         
         // 事件回调
         this.onMessageReceived = null;
@@ -23,9 +22,6 @@ class RealtimeClient {
         this.onError = null;
         this.onRoomData = null;
         this.onUserTyping = null;
-        this.onVoiceParticipants = null;
-        this.onWebRTCSignal = null;
-        this.onTranscriptUpdate = null;
         
         // 检测运行环境
         this.isHuggingFace = window.location.hostname.includes('huggingface.co');
@@ -283,29 +279,6 @@ class RealtimeClient {
                 this.onUserLeft(data);
             }
         });
-
-        // 語音相關事件
-        this.socket.on('voice-participants', (payload) => {
-            if (this.onVoiceParticipants) {
-                this.onVoiceParticipants(payload);
-            }
-        });
-
-        // WebRTC 訊號轉發
-        this.socket.on('webrtc-offer', (data) => {
-            if (this.onWebRTCSignal) this.onWebRTCSignal('offer', data);
-        });
-        this.socket.on('webrtc-answer', (data) => {
-            if (this.onWebRTCSignal) this.onWebRTCSignal('answer', data);
-        });
-        this.socket.on('webrtc-ice-candidate', (data) => {
-            if (this.onWebRTCSignal) this.onWebRTCSignal('ice', data);
-        });
-
-        // 實時轉錄
-        this.socket.on('transcript-update', (data) => {
-            if (this.onTranscriptUpdate) this.onTranscriptUpdate(data);
-        });
         
         this.socket.on('userTyping', (data) => {
             if (this.onUserTyping) {
@@ -394,32 +367,6 @@ class RealtimeClient {
             });
         }
     }
-
-    // 語音 / WebRTC / 轉錄
-    emitVoiceJoin(roomId, userId) {
-        if (this.socket && this.isConnected) {
-            this.socket.emit('voice-join', { roomId, userId });
-        }
-    }
-    emitVoiceLeave(roomId, userId) {
-        if (this.socket && this.isConnected) {
-            this.socket.emit('voice-leave', { roomId, userId });
-        }
-    }
-    emitWebRTCSignal(eventType, payload) {
-        if (!this.socket || !this.isConnected) return;
-        const map = {
-            offer: 'webrtc-offer',
-            answer: 'webrtc-answer',
-            ice: 'webrtc-ice-candidate'
-        };
-        const evt = map[eventType];
-        if (evt) this.socket.emit(evt, payload);
-    }
-    emitTranscriptUpdate(data) {
-        if (!this.socket || !this.isConnected) return;
-        this.socket.emit('transcript-update', data);
-    }
     
     // 结束会议（仅创建者可调用）
     endMeeting(roomId, userId) {
@@ -435,21 +382,16 @@ class RealtimeClient {
     
     // 配置回调函数
     setEventHandlers(handlers) {
-        // 合併策略：僅覆蓋傳入的鍵，其餘保留既有
-        this._handlers = { ...this._handlers, ...handlers };
-        this.onMessageReceived = this._handlers.onMessageReceived;
-        this.onParticipantsUpdate = this._handlers.onParticipantsUpdate;
-        this.onUserJoined = this._handlers.onUserJoined;
-        this.onUserLeft = this._handlers.onUserLeft;
-        this.onConnectionChange = this._handlers.onConnectionChange;
-        this.onError = this._handlers.onError;
-        this.onRoomData = this._handlers.onRoomData;
-        this.onUserTyping = this._handlers.onUserTyping;
-        this.onMeetingEnded = this._handlers.onMeetingEnded;
-        this.onEndMeetingSuccess = this._handlers.onEndMeetingSuccess;
-        this.onVoiceParticipants = this._handlers.onVoiceParticipants;
-        this.onWebRTCSignal = this._handlers.onWebRTCSignal;
-        this.onTranscriptUpdate = this._handlers.onTranscriptUpdate;
+        this.onMessageReceived = handlers.onMessageReceived;
+        this.onParticipantsUpdate = handlers.onParticipantsUpdate;
+        this.onUserJoined = handlers.onUserJoined;
+        this.onUserLeft = handlers.onUserLeft;
+        this.onConnectionChange = handlers.onConnectionChange;
+        this.onError = handlers.onError;
+        this.onRoomData = handlers.onRoomData;
+        this.onUserTyping = handlers.onUserTyping;
+        this.onMeetingEnded = handlers.onMeetingEnded;
+        this.onEndMeetingSuccess = handlers.onEndMeetingSuccess;
     }
     
     // 状态查询
