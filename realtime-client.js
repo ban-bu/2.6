@@ -212,6 +212,11 @@ class RealtimeClient {
             
             showToast('实时连接已建立', 'success');
             
+            // 重新设置语音功能事件监听器
+            if (typeof onRealtimeClientConnected === 'function') {
+                onRealtimeClientConnected();
+            }
+            
             // 如果已经有房间信息，重新加入
             if (this.currentRoomId && this.currentUserId && this.currentUsername) {
                 this.joinRoom(this.currentRoomId, this.currentUserId, this.currentUsername);

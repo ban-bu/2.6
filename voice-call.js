@@ -39,20 +39,38 @@ class VoiceCallManager {
     
     initializeEventListeners() {
         // 监听语音通话相关的Socket事件
-        if (typeof socket !== 'undefined') {
+        this.setupSocketEventListeners();
+    }
+    
+    setupSocketEventListeners() {
+        const socket = this.getSocket();
+        if (socket) {
             socket.on('voice-call-offer', this.handleOffer.bind(this));
             socket.on('voice-call-answer', this.handleAnswer.bind(this));
             socket.on('voice-call-ice-candidate', this.handleIceCandidate.bind(this));
             socket.on('voice-call-user-joined', this.handleUserJoined.bind(this));
             socket.on('voice-call-user-left', this.handleUserLeft.bind(this));
             socket.on('voice-call-ended', this.handleCallEnded.bind(this));
+            socket.on('voice-call-existing-users', this.handleExistingUsers.bind(this));
         }
+    }
+    
+    getSocket() {
+        if (window.realtimeClient && window.realtimeClient.socket) {
+            return window.realtimeClient.socket;
+        }
+        return null;
     }
     
     // 开始语音通话
     async startCall() {
         try {
             console.log('开始语音通话...');
+            
+            const socket = this.getSocket();
+            if (!socket) {
+                throw new Error('WebSocket连接未建立，请刷新页面重试');
+            }
             
             // 获取用户媒体权限
             this.localStream = await navigator.mediaDevices.getUserMedia(this.audioConstraints);
@@ -62,7 +80,7 @@ class VoiceCallManager {
             
             // 通知服务器开始通话
             socket.emit('voice-call-start', {
-                roomId: currentRoomId,
+                roomId: roomId,
                 userId: currentUserId,
                 username: currentUsername
             });
@@ -103,10 +121,13 @@ class VoiceCallManager {
             }
             
             // 通知服务器结束通话
-            socket.emit('voice-call-end', {
-                roomId: currentRoomId,
-                userId: currentUserId
-            });
+            const socket = this.getSocket();
+            if (socket) {
+                socket.emit('voice-call-end', {
+                    roomId: roomId,
+                    userId: currentUserId
+                });
+            }
             
             this.isCallActive = false;
             this.updateUI();
@@ -128,11 +149,14 @@ class VoiceCallManager {
             this.isMuted = !audioTrack.enabled;
             
             // 通知其他用户静音状态
-            socket.emit('voice-call-mute-status', {
-                roomId: currentRoomId,
-                userId: currentUserId,
-                isMuted: this.isMuted
-            });
+            const socket = this.getSocket();
+            if (socket) {
+                socket.emit('voice-call-mute-status', {
+                    roomId: roomId,
+                    userId: currentUserId,
+                    isMuted: this.isMuted
+                });
+            }
             
             this.updateUI();
         }
@@ -152,11 +176,14 @@ class VoiceCallManager {
         // 处理ICE候选
         peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
-                socket.emit('voice-call-ice-candidate', {
-                    roomId: currentRoomId,
-                    targetUserId: userId,
-                    candidate: event.candidate
-                });
+                const socket = this.getSocket();
+                if (socket) {
+                    socket.emit('voice-call-ice-candidate', {
+                        roomId: roomId,
+                        targetUserId: userId,
+                        candidate: event.candidate
+                    });
+                }
             }
         };
         
@@ -192,11 +219,14 @@ class VoiceCallManager {
             const answer = await peerConnection.createAnswer();
             await peerConnection.setLocalDescription(answer);
             
-            socket.emit('voice-call-answer', {
-                roomId: currentRoomId,
-                targetUserId: fromUserId,
-                answer: answer
-            });
+            const socket = this.getSocket();
+            if (socket) {
+                socket.emit('voice-call-answer', {
+                    roomId: roomId,
+                    targetUserId: fromUserId,
+                    answer: answer
+                });
+            }
             
         } catch (error) {
             console.error('处理offer失败:', error);
@@ -247,11 +277,14 @@ class VoiceCallManager {
             const offer = await peerConnection.createOffer();
             await peerConnection.setLocalDescription(offer);
             
-            socket.emit('voice-call-offer', {
-                roomId: currentRoomId,
-                targetUserId: userId,
-                offer: offer
-            });
+            const socket = this.getSocket();
+            if (socket) {
+                socket.emit('voice-call-offer', {
+                    roomId: roomId,
+                    targetUserId: userId,
+                    offer: offer
+                });
+            }
             
             this.updateCallStatus();
             
@@ -288,6 +321,16 @@ class VoiceCallManager {
     handleCallEnded() {
         console.log('语音通话已被结束');
         this.endCall();
+    }
+    
+    // 处理现有用户列表
+    handleExistingUsers(users) {
+        console.log('收到现有语音用户列表:', users);
+        
+        // 为每个现有用户创建连接
+        users.forEach(user => {
+            this.handleUserJoined(user);
+        });
     }
     
     // 播放远程音频
@@ -676,9 +719,9 @@ class VoiceTranscriptionManager {
         transcriptionContent.scrollTop = transcriptionContent.scrollHeight;
         
         // 通过Socket发送转录结果给其他用户
-        if (typeof socket !== 'undefined') {
-            socket.emit('voice-transcription', {
-                roomId: currentRoomId,
+        if (window.realtimeClient && window.realtimeClient.socket) {
+            window.realtimeClient.socket.emit('voice-transcription', {
+                roomId: roomId,
                 userId: currentUserId,
                 username: currentUsername,
                 text: text,
@@ -765,6 +808,9 @@ function initializeVoiceFeatures() {
     voiceCallManager = new VoiceCallManager();
     voiceTranscriptionManager = new VoiceTranscriptionManager(voiceCallManager);
     
+    // 设置转录Socket监听器
+    setupTranscriptionSocketListener();
+    
     console.log('语音功能已初始化');
 }
 
@@ -844,16 +890,18 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // 监听来自其他用户的转录消息
-if (typeof socket !== 'undefined') {
-    socket.on('voice-transcription', function(data) {
-        const { userId, username, text, timestamp, isReplace } = data;
-        
-        // 如果是自己发送的，忽略
-        if (userId === currentUserId) return;
-        
-        // 显示其他用户的转录
-        displayRemoteTranscription(username, text, timestamp, isReplace);
-    });
+function setupTranscriptionSocketListener() {
+    if (window.realtimeClient && window.realtimeClient.socket) {
+        window.realtimeClient.socket.on('voice-transcription', function(data) {
+            const { userId, username, text, timestamp, isReplace } = data;
+            
+            // 如果是自己发送的，忽略
+            if (userId === currentUserId) return;
+            
+            // 显示其他用户的转录
+            displayRemoteTranscription(username, text, timestamp, isReplace);
+        });
+    }
 }
 
 // 显示远程用户的转录
@@ -900,3 +948,11 @@ document.addEventListener('DOMContentLoaded', function() {
     // 延迟初始化，确保其他依赖已加载
     setTimeout(initializeVoiceFeatures, 1000);
 });
+
+// 在实时客户端连接成功后重新设置事件监听器
+function onRealtimeClientConnected() {
+    if (voiceCallManager) {
+        voiceCallManager.setupSocketEventListeners();
+    }
+    setupTranscriptionSocketListener();
+}
